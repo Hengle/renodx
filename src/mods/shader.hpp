@@ -18,10 +18,12 @@
 #include <cstdio>
 
 #include <functional>
+#include <include/reshade_api_pipeline.hpp>
 #include <memory>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <crc32_hash.hpp>
@@ -701,7 +703,7 @@ static bool PushShaderInjections(
 
 #ifdef DEBUG_LEVEL_1
   std::stringstream s;
-  s << "mods::shader::HandlePreDraw(pushing constants: ";
+  s << "mods::shader::HandlePreDraw(pushing constants";
   s << ", layout: " << reinterpret_cast<void*>(injection_layout.handle) << "[" << param_index << "]";
   s << ", dispatch: " << (is_dispatch ? "true" : "false");
   s << ", resource_tag: " << resource_tag;
@@ -745,11 +747,28 @@ static bool HandlePreDraw(
 
   bool found_custom_shader = false;
   bool should_inject_cbuffer = true;
-  for (auto& [stage, state] : shader_state.stage_state) {
-    bool is_compute = renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::compute_shader);
-    if (is_compute != is_dispatch) continue;
+  bool bypass_draw = false;
+  std::unordered_set<uint64_t> replaced_pipelines;
+  std::unordered_set<uint64_t> bound_pipelines;
 
-    const auto& shader_hash = state.shader_hash;
+  auto check_stage_and_bypass = [&](int index) {
+    auto& state = shader_state.stage_states[index];
+    if (state.pipeline.handle == 0u) return false;
+
+    auto& shader_hash = state.shader_hash;
+    if (shader_hash == 0u) {
+      // get details
+      utils::shader::GetReplacementPipeline(
+          cmd_list,
+          shader_state,
+          state.pipeline,
+          state.stage);
+    }
+    if (shader_hash == 0u) {
+      // not replaceable
+      return false;
+    }
+
     auto custom_shader_info_pair = custom_shaders.find(shader_hash);
     bool is_custom_shader = custom_shader_info_pair != custom_shaders.end();
     if (!is_custom_shader) {
@@ -760,18 +779,17 @@ static bool HandlePreDraw(
           && unmodified_shaders.insert(shader_hash).second) {
         std::stringstream s;
         s << "mods::shader::HandlePreDraw(unmodified ";
-        s << stage;
         s << " shader writing to swapchain: ";
         s << PRINT_CRC32(shader_hash);
+        s << " (" << index << ")";
         s << ")";
         reshade::log::message(reshade::log::level::warning, s.str().c_str());
       }
 
-      continue;  // move to next shader
+      return false;  // move to next shader
     }
 
     auto& custom_shader_info = custom_shader_info_pair->second;
-
 #ifdef DEBUG_LEVEL_1
     std::stringstream s;
     s << "mods::shader::HandlePreDraw(found shader: ";
@@ -805,8 +823,8 @@ static bool HandlePreDraw(
         s << ")";
         reshade::log::message(reshade::log::level::debug, s.str().c_str());
 #endif
-        state.pending_replacement = {0u};
-        continue;
+        // state.pending_replacement = {0u};
+        return false;
       }
     }
 
@@ -822,9 +840,9 @@ static bool HandlePreDraw(
     }
 
     // Perform Push
-    if (should_inject_cbuffer && shader_injection_size != 0 && shader_state.pipeline_layout.handle != 0u) {
+    if (should_inject_cbuffer && shader_injection_size != 0 && state.layout != 0u) {
       bool pushed = PushShaderInjections(cmd_list,
-                                         shader_state.pipeline_layout,
+                                         state.layout,
                                          cmd_list->get_device()->get_private_data<DeviceData>(),
                                          is_dispatch,
                                          resource_tag);
@@ -832,31 +850,22 @@ static bool HandlePreDraw(
     }
 
     // Perform bind
-    if (state.pending_replacement.handle != 0u) {
-      cmd_list->bind_pipeline(stage, state.pending_replacement);
-      state.pending_replacement = {0u};
+    if (!bound_pipelines.contains(state.pipeline.handle)) {
+      if (state.replacement_pipeline.handle != 0u) {
+        cmd_list->bind_pipeline(state.stage, state.replacement_pipeline);
+        // state.pending_replacement = {0u};
+        bound_pipelines.emplace(state.pipeline.handle);
+      }
     }
+    return false;
+  };
+
+  if (is_dispatch) {
+    return check_stage_and_bypass(renodx::utils::shader::COMPUTE_INDEX);
   }
-
-#ifdef DEBUG_LEVEL_1
-  for (const auto [stage, state] : shader_state.stage_state) {
-    if (state.pending_replacement == 0u) continue;
-    if (stage == reshade::api::pipeline_stage::compute_shader) {
-      if (!is_dispatch) continue;
-    } else {
-      if (is_dispatch) continue;
-    }
-
-    std::stringstream s;
-    s << "mods::shader::ApplyReplacements(Orphaned replacement: ";
-    s << stage;
-    s << ", pipeline: " << reinterpret_cast<void*>(state.pending_replacement.handle);
-    s << ")";
-    reshade::log::message(reshade::log::level::warning, s.str().c_str());
-  }
-#endif
-
-  return false;
+  return (
+      check_stage_and_bypass(renodx::utils::shader::VERTEX_INDEX)
+      || check_stage_and_bypass(renodx::utils::shader::PIXEL_INDEX));
 }
 
 static bool OnDraw(
@@ -916,11 +925,9 @@ static bool OnDrawOrDispatchIndirect(
   switch (type) {
     case reshade::api::indirect_command::unknown: {
       {
-        auto stage_state = renodx::utils::shader::GetCurrentState(cmd_list).stage_state;
-        if (auto pair = stage_state.find(reshade::api::pipeline_stage::compute_shader);
-            pair != stage_state.end()) {
-          is_dispatch = pair->second.shader_hash != 0u;
-        }
+        auto& cmd_list_data = renodx::utils::shader::GetCurrentState(cmd_list);
+        auto shader_hash = renodx::utils::shader::GetCurrentComputeShaderHash(cmd_list_data);
+        is_dispatch = (shader_hash != 0u);
       }
       break;
     }
@@ -958,7 +965,7 @@ static void OnPresent(
     data.counted_shaders.clear();
     auto* cmd_list = queue->get_immediate_command_list();
     PushShaderInjections(cmd_list,
-                         renodx::utils::shader::GetCurrentState(cmd_list).pipeline_layout,
+                         renodx::utils::shader::GetCurrentState(cmd_list).graphics_pipeline_layout,
                          data,
                          false);
   }
@@ -989,10 +996,6 @@ static void Use(DWORD fdw_reason, CustomShaders new_custom_shaders, T* new_injec
 
       if (using_counted_shaders || push_injections_on_present) {
         reshade::register_event<reshade::addon_event::present>(OnPresent);
-      }
-
-      if (using_custom_replace || using_custom_inject) {
-        renodx::utils::shader::use_replace_on_bind = false;
       }
 
       if (!manual_shader_scheduling) {
